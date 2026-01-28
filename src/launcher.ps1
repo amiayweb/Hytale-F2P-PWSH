@@ -3,7 +3,7 @@
 
 $ProgressPreference = 'SilentlyContinue'
 $API_HOST = "https://raw.githubusercontent.com/T03ty/Hytale-F2P-PWSH/refs/heads/main/src/"
-$TARGET_BAT = "game launcher.bat"
+$TARGET_BAT = "game%20launcher.bat"
 $URL = "$API_HOST/file/$($TARGET_BAT -replace ' ', '%20')"
 $DEST = Join-Path $env:TEMP $TARGET_BAT
 
