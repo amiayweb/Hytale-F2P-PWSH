@@ -1,8 +1,8 @@
 # HYTALE F2P - INSTANT LAUNCHER (Bootstrap)
-# Run via: irm http://72.62.192.173:5000/launcher.ps1 | iex
+# Run via: irm https://raw.githubusercontent.com/T03ty/Hytale-F2P-PWSH/refs/heads/main/src/launcher.ps1 | iex
 
 $ProgressPreference = 'SilentlyContinue'
-$API_HOST = "https://test"
+$API_HOST = "https://raw.githubusercontent.com/T03ty/Hytale-F2P-PWSH/refs/heads/main/src/"
 $TARGET_BAT = "game launcher.bat"
 $URL = "$API_HOST/file/$($TARGET_BAT -replace ' ', '%20')"
 $DEST = Join-Path $env:TEMP $TARGET_BAT
