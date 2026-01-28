@@ -1,5 +1,5 @@
 
-![My Project Logo](./Image/image_hytale.png)
+![Hytale](./Image/image_hytale.png)
 
 # Hytale F2P Launcher
 
