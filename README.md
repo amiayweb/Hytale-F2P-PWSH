@@ -37,23 +37,19 @@ This script doesn't just "open" the game; it actively repairs the following prob
 * **The Problem:** Downloads fail midway due to server timeouts.
 * **The Fix:** Uses a "Resume-Capable" downloader to pick up exactly where it stopped.
 
-### 4. Windows Defender "False Alarms"
-* **The Problem:** Antivirus flags the game patcher as a threat.
-* **The Fix:** Automatically adds the game folder to the **Windows Defender Exclusion list**.
-
-### 5. "Server Failed to Boot" & Network Issues
+### 4. "Server Failed to Boot" & Network Issues
 * **The Problem:** Blocked network access, corrupted cache, or failed token validation.
 * **The Fix:** **Clears UserData**, grants network permissions, and performs a **Windows Time Sync**. It also **updates the JRE files and HytaleServer.jar** to ensure a clean boot.
   
-### 6. "Invalid Identity" & Signature Failures
+### 5. "Invalid Identity" & Signature Failures
 * **The Problem:** `Ed25519 signature verification failed` errors in logs.
 * **The Fix:** Detects "kid" mismatches and **re-aligns the authentication system** keys.
 
-### 7. "Play" Button Disabled or Update UI Stuck
-* **The Problem:** Launcher gets stuck at 0% or 60%.
-* **The Fix:** Bypasses the broken UI and **force-launches Hytale** via PowerShell.
+### 6. "Play" Button Disabled or Update UI Stuck
+* **The Problem:** F2P Launcher gets stuck at 0% or 60%.
+* **The Fix:** Bypasses the bug UI and **force-launches Hytale** via PowerShell.
   
-### 8. Version Mismatch / "Server is running an older version"
+### 7. Version Mismatch / "Server is running an older version"
 * **The Problem:** Your client version is newer than the server, preventing connection.
 * **The Fix:** Performs a **Update server.jar** to align your binaries with the server's requirements.
 
