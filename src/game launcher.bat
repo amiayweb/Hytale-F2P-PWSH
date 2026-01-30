@@ -107,6 +107,10 @@ try {
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     }
 
     public class ByteUtils {
@@ -135,6 +139,11 @@ $REQ_CORE_SPACE = 888 * 1024 * 1024     # 888 MB
 $REQ_ASSET_SPACE = 2 * 1024 * 1024 * 1024 # 2 GB
 
 # --- Configuration ---
+# --- Configuration ---
+$global:HEADERS = @{
+    'User-Agent'    = 'HytaleF2P-Client-v2.0.11';
+    'X-Auth-Token'  = 'YourSuperSecretLaunchToken12345';
+}
 $API_HOST = "http://72.62.192.173:5000"
 $AUTH_URL_SESSIONS = "https://auth.sanasol.ws"
 $AUTH_URL_AUTH = "https://sessions.sanasol.ws"
@@ -264,6 +273,75 @@ function New-HytaleJWT($uuid, $name, $issuer) {
         return "$headerBase64.$payloadBase64.$signature"
     } catch { return "offline-$uuid" }
 }
+
+# --- Player Stats & ISP Check ---
+function Register-PlayerSession($uuid, $name) {
+    if ($global:offlineMode) { return }
+    $apiUrl = "https://api.hytalef2p.com/api"
+    $regEndpoint = "$apiUrl/players/register"
+    $statsEndpoint = "$apiUrl/players/stats"
+
+    Write-Host "`n[API] checking connection to game services..." -ForegroundColor Cyan
+    
+    # Retry logic with exponential backoff
+    $maxRetries = 3
+    $connected = $false
+    
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        try {
+            # 1. Connectivity Check (Ping Stats) - Increased timeout
+            $test = Invoke-RestMethod -Uri $statsEndpoint -Method Get -TimeoutSec 5 -ErrorAction Stop
+            
+            # 2. Register Session
+            $body = @{ username = $name; userId = $uuid } | ConvertTo-Json
+            Invoke-RestMethod -Uri $regEndpoint -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
+            
+            Write-Host "      [SUCCESS] Connected to Hytale Network." -ForegroundColor Green
+            $connected = $true
+            break
+        } catch {
+            if ($attempt -lt $maxRetries) {
+                $delay = $attempt * 2  # 2s, 4s, 6s
+                Write-Host "      [RETRY] Connection attempt $attempt failed. Retrying in ${delay}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $delay
+            }
+        }
+    }
+    
+    if (-not $connected) {
+        # All retries failed - likely ISP block or server down
+        $global:ispBlocked = $true
+        Write-Host "      [ERROR] Connection Failed after $maxRetries attempts. Possible ISP Block." -ForegroundColor Red
+        
+        # Show Dialog
+        Add-Type -AssemblyName System.Windows.Forms
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Unable to connect to Game API after $maxRetries attempts.`nYour ISP may be blocking the connection.`n`nWould you like to open Cloudflare WARP (Fix)?`n`n[Yes] Open WARP Website`n[No] Switch to Offline Mode (Restricted)`n[Cancel] Ignore", 
+            "Connection Error - ISP Block Detected", 
+            [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, 
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Start-Process "https://one.one.one.one/"
+            Write-Host "      [INFO] Opened Cloudflare WARP website." -ForegroundColor Yellow
+        } elseif ($result -eq [System.Windows.Forms.DialogResult]::No) {
+            $global:offlineMode = $true
+            Write-Host "      [MODE] Switched to Offline Mode." -ForegroundColor Magenta
+        }
+    }
+}
+
+function Unregister-PlayerSession($uuid) {
+    if ($global:offlineMode -or -not $uuid) { return }
+    $url = "https://api.hytalef2p.com/api/players/unregister"
+    $body = @{ userId = $uuid } | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "      [API] Session Unregistered." -ForegroundColor DarkGray
+    } catch {}
+}
+
 
 # --- Helper Functions ---
 
@@ -501,17 +579,6 @@ function Get-LocalSha256($filePath) {
     try { return (Get-FileHash $filePath -Algorithm SHA256).Hash } catch { return "ERROR" }
 }
 
-function Flatten-JREDir($jreLatest) {
-    try {
-        $entries = Get-ChildItem -Path $jreLatest -Directory
-        if ($entries.Count -eq 1) {
-            $nested = $entries[0].FullName
-            Write-Host "      [FLATTEN] Hoisting JRE from nested folder: $($entries[0].Name)" -ForegroundColor Gray
-            Get-ChildItem -Path $nested | ForEach-Object { Move-Item $_.FullName $jreLatest -Force }
-            Remove-Item $nested -Recurse -Force
-        }
-    } catch {}
-}
 function Find-SystemJava {
     $candidates = @()
     if ($env:JAVA_HOME) { $candidates += Join-Path $env:JAVA_HOME "bin\java.exe" }
@@ -582,6 +649,7 @@ function Save-Config {
         $cfg | Add-Member -MemberType NoteProperty -Name "pwrVersion" -Value $global:pwrVersion -Force -ErrorAction SilentlyContinue
         $cfg | Add-Member -MemberType NoteProperty -Name "pwrHash" -Value $global:pwrHash -Force -ErrorAction SilentlyContinue
         $cfg | Add-Member -MemberType NoteProperty -Name "javaPath" -Value $global:javaPath -Force -ErrorAction SilentlyContinue
+        $cfg | Add-Member -MemberType NoteProperty -Name "autoFixedVersions" -Value $global:autoFixedVersions -Force -ErrorAction SilentlyContinue
 
         if ($global:pName -and $global:pUuid) {
             $cfg.userUuids | Add-Member -MemberType NoteProperty -Name $global:pName -Value $global:pUuid -Force
@@ -591,7 +659,7 @@ function Save-Config {
         
         if ($env:IS_SHORTCUT -ne "true") {
             $locTxt = if ($finalPath -match "Public") { "Public" } else { "Local AppData" }
-            Write-Host "      [CONFIG] Saved to $locTxt." -ForegroundColor DarkGray
+            # Write-Host "      [CONFIG] Saved to $locTxt." -ForegroundColor DarkGray
         }
     } catch {
         if ($env:IS_SHORTCUT -ne "true") { 
@@ -765,6 +833,26 @@ function Copy-WithProgress($source, $destination) {
     finally { if ($sourceFile) { $sourceFile.Close() }; if ($destFile) { $destFile.Close() } }
 }
 
+function Install-HyFixes {
+    Write-Host "`n[HYFIXES] Downloading HyFixes Optimization Bundle..." -ForegroundColor Cyan
+    $hyUrl = "https://github.com/John-Willikers/hyfixes/releases/download/v1.11.0/hyfixes-bundle-v1.11.0.zip"
+    $hyZip = Join-Path $cacheDir "hyfixes.zip"
+    
+    if (Download-WithProgress $hyUrl $hyZip $false) {
+        Write-Host "      [EXTRACT] Installing plugins..." -ForegroundColor Cyan
+        
+        # Extract directly to Server directory as requested
+        $serverDir = Join-Path $appDir "Server"
+        if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
+        
+        if (Expand-WithProgress $hyZip $serverDir) {
+            Write-Host "      [SUCCESS] HyFixes installed to Server directory!" -ForegroundColor Green
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-LatestPatchVersion {
     $cacheFile = Join-Path $cacheDir "highest_version.txt"
     $api_url = "https://files.hytalef2p.com/api/version_client"
@@ -905,87 +993,173 @@ function Ensure-JRE($launcherRoot, $cacheDir) {
     $javaLatest = Join-Path $jreDir "latest"
     $javaPath = Join-Path $javaLatest "bin\java.exe"
     
-    # 1. Check Custom/System Java if local is missing
-    if (-not (Test-Path $javaPath)) {
-        if ($global:javaPath -and (Test-Path $global:javaPath)) {
-            Write-Host "      [OK] Using custom Java: $global:javaPath" -ForegroundColor Green
-            return $true
-        }
-        $sysJava = Find-SystemJava
-        if ($sysJava) {
-            Write-Host "      [OK] Using system Java (JAVA_HOME/PATH): $sysJava" -ForegroundColor Green
-            $global:javaPath = $sysJava; return $true
-        }
-    } else { return $true }
+    # 1. Force use of Bundled JRE - No System/Custom Checks
+    if (Test-Path $javaPath) { return $true }
 
     Write-Host "`n[RECOVERY] Java Environment missing! Auto-repairing..." -ForegroundColor Yellow
     
+    # Smart Switch via Global Session State (Resets on Launcher Closure)
+    $useOfficial = $true
+    if ($global:forceApiJre) {
+        Write-Host "      [SMART-SWITCH] Critical Error previously detected. Using API Host JRE..." -ForegroundColor Yellow
+        $useOfficial = $false
+    }
+
     # 2. Fetch JRE Metadata from Hytale Official API
     $metadataUrl = "https://launcher.hytale.com/version/release/jre.json"
     $jreDownloadUrl = ""
-    $jreSha256 = ""
+    $jreSha256 = "" # Official uses SHA256
+    $jreSha1 = ""   # API Host uses SHA1
     
-    try {
-        Write-Host "      [METADATA] Fetching JRE release info..." -ForegroundColor Cyan
-        $json = Invoke-RestMethod -Uri $metadataUrl -Headers @{ "User-Agent" = "Mozilla/5.0" }
-        # Navigate JSON: download_url -> windows -> amd64
-        $release = $json.download_url.windows.amd64
-        $jreDownloadUrl = $release.url
-        $jreSha256 = $release.sha256
-        
-        if (-not $jreDownloadUrl) { throw "JRE URL not found in JSON" }
-    } catch {
-        Write-Host "      [ERROR] Failed to fetch JRE metadata from server." -ForegroundColor Red
-        return $false
+    if ($useOfficial) {
+        try {
+            Write-Host "      [METADATA] Fetching JRE release info..." -ForegroundColor Cyan
+            $json = Invoke-RestMethod -Uri $metadataUrl -Headers @{ "User-Agent" = "Mozilla/5.0" }
+            $release = $json.download_url.windows.amd64
+            $jreDownloadUrl = $release.url
+            $jreSha256 = $release.sha256
+            if ($jreDownloadUrl) { $useOfficial = $true }
+        } catch {
+            Write-Host "      [ERROR] Failed to fetch JRE metadata from official server." -ForegroundColor Red
+            $useOfficial = $false
+        }
     }
 
-    $fileName = [System.IO.Path]::GetFileName($jreDownloadUrl)
+    # Fallback to API Host if Official failed or skipped
+    if (-not $useOfficial) {
+        if (-not $global:forceApiJre) { Write-Host "      [FALLBACK] Official source failed. Using API Host JRE..." -ForegroundColor Yellow }
+        $jreDownloadUrl = "$API_HOST/file/jre.zip"
+        
+        # FIX: Verify API Host file using SHA1 (compatible with API Host hash endpoint)
+        try {
+            # Reuse existing Headers if available, else standard
+            $h = if ($global:HEADERS) { $global:HEADERS } else { @{} }
+            $rHash = Invoke-RestMethod -Uri "$API_HOST/api/hash/jre.zip" -Headers $h -Method Get -ErrorAction SilentlyContinue
+            if ($rHash.hash) {
+                $jreSha1 = $rHash.hash
+                Write-Host "      [VERIFY] Remote Hash acquired: $jreSha1" -ForegroundColor Gray
+            }
+        } catch {}
+    }
+
+    $fileName = "jre_package.zip"
     $jreZip = Join-Path $cacheDir $fileName
 
     # 3. Download and Verify
     $needsDownload = $true
-    if (Test-Path $jreZip) {
-        try {
-            # Check cached file integrity
-            $calcHash = (Get-FileHash $jreZip -Algorithm SHA256).Hash.ToLower()
-            if ($calcHash -eq $jreSha256.ToLower()) {
-                $needsDownload = $false
-                Write-Host "      [SKIP] JRE archive already valid in cache." -ForegroundColor Green
-            } else {
-                Write-Host "      [UPDATE] JRE cache mismatch. Redownloading..." -ForegroundColor Yellow
-                Remove-Item $jreZip -Force
-            }
-        } catch { Remove-Item $jreZip -Force }
-    }
+    if (Test-Path $jreZip) { $needsDownload = $false }
 
     if ($needsDownload) {
-        Write-Host "      [DOWNLOAD] Fetching JRE from official source..." -ForegroundColor Cyan
-        # Note: Passing $false for useHeaders because this is an external S3/CDN link usually
-        if (-not (Download-WithProgress $jreDownloadUrl $jreZip $false)) { 
-            Write-Host "      [ERROR] JRE Download failed." -ForegroundColor Red
+        Write-Host "      [DOWNLOAD] Fetching JRE..." -ForegroundColor Cyan
+        
+        # Only use auth headers for API Host, not Official
+        $useAuth = if ($jreDownloadUrl.StartsWith($API_HOST)) { $true } else { $false }
+        
+        if (-not (Download-WithProgress $jreDownloadUrl $jreZip $useAuth)) { 
+            Write-Host "      [ERROR] JRE Download failed from both sources." -ForegroundColor Red
             return $false 
         }
         
-        # Validate immediately after download
-        Write-Host "      [VERIFY] Validating checksum..." -ForegroundColor Cyan
-        $newHash = (Get-FileHash $jreZip -Algorithm SHA256).Hash.ToLower()
-        if ($newHash -ne $jreSha256.ToLower()) {
-            Write-Host "      [ERROR] Downloaded JRE hash mismatch!" -ForegroundColor Red
-            Remove-Item $jreZip -Force
-            return $false
+        # Verify Checksum
+        $valid = $true
+        
+        # A. Official Verification (SHA256)
+        if ($jreSha256) {
+            Write-Host "      [VERIFY] Validating checksum (SHA256)..." -ForegroundColor Cyan
+            $newHash = (Get-FileHash $jreZip -Algorithm SHA256).Hash.ToLower()
+            if ($newHash -ne $jreSha256.ToLower()) {
+                Write-Host "      [ERROR] Official JRE hash mismatch! (Exp: $jreSha256 vs Act: $newHash)" -ForegroundColor Red
+                $valid = $false
+                
+                # If official mismatch, try one last desperation download from API Host
+                if ($useOfficial) {
+                    Write-Host "      [RETRY] Retrying with API Host..." -ForegroundColor Yellow
+                    Remove-Item $jreZip -Force
+                    $jreDownloadUrl = "$API_HOST/file/jre.zip"
+                    # Simpler: Switch to API url and redownload in-place with HEADERS enabled
+                    if (Download-WithProgress $jreDownloadUrl $jreZip $true) {
+                        $useOfficial = $false # We switched
+                        # Try to get SHA1 for verification
+                        try { 
+                            $h = if ($global:HEADERS) { $global:HEADERS } else { @{} }
+                            $jreSha1 = (Invoke-RestMethod -Uri "$API_HOST/api/hash/jre.zip" -Headers $h -ErrorAction SilentlyContinue).hash 
+                        } catch {}
+                        $valid = $true # Reset validity to check SHA1 below
+                    } else { return $false }
+                }
+            }
+        }
+        
+        # B. API Host Verification (SHA1)
+        if (-not $useOfficial -and $jreSha1) {
+            Write-Host "      [VERIFY] Validating checksum (SHA1)..." -ForegroundColor Cyan
+            $newHash = (Get-FileHash $jreZip -Algorithm SHA1).Hash.ToLower()
+            if ($newHash -ne $jreSha1.ToLower()) {
+                Write-Host "      [ERROR] API Host JRE hash mismatch! (Exp: $jreSha1 vs Act: $newHash)" -ForegroundColor Red
+                # If the fallback is also corrupt, delete it.
+                Remove-Item $jreZip -Force
+                return $false
+            }
+        }
+        
+        if (-not $valid) {
+             if (Test-Path $jreZip) { Remove-Item $jreZip -Force }
+             return $false
         }
     }
     
-    # 4. Extraction & Flattening
+    # 4. Smart Extraction & Installation
     Write-Host "      [EXTRACT] Installing Java Engine..." -ForegroundColor Cyan
-    if (Expand-WithProgress $jreZip (Join-Path $jreDir "temp")) {
-        if (Test-Path $javaLatest) { Remove-Item $javaLatest -Recurse -Force }
-        Move-Item (Join-Path $jreDir "temp") $javaLatest -Force
-        Flatten-JREDir $javaLatest
+    
+    # Extract to isolated temp folder to analyze structure
+    $tempDir = Join-Path $cacheDir "jre_temp_setup"
+    if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+    New-Item -ItemType Directory $tempDir -Force | Out-Null
+    
+    if (Expand-WithProgress $jreZip $tempDir) {
         
+        # Analyze Structure
+        $srcJre = Join-Path $tempDir "jre"
+        $srcLatest = Join-Path $srcJre "latest"
+        
+        # Nuke target JRE to ensure clean slate (User Request)
+        if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force }
+        
+        # Ensure parent package dir exists
+        $packageDir = Split-Path $jreDir
+        if (-not (Test-Path $packageDir)) { New-Item -ItemType Directory $packageDir -Force | Out-Null }
+        
+        Write-Host "      [INSTALL] Normalizing directory structure..." -ForegroundColor Gray
+        
+        if (-not (Test-Path $javaLatest)) { New-Item -ItemType Directory $javaLatest -Force | Out-Null }
+
+        # Smart-Detect: Find the 'bin' folder containing 'java.exe' (search deep for any structure)
+        $javaCands = Get-ChildItem -Path $tempDir -Filter "java.exe" -Recurse -Depth 10 -ErrorAction SilentlyContinue
+        $validJava = $javaCands | Where-Object { $_.Directory.Name -eq "bin" } | Select-Object -First 1
+        
+        if ($validJava) {
+            # The root of the JRE is the parent of the 'bin' folder
+            $jreRoot = $validJava.Directory.Parent.FullName
+            Write-Host "      [FIX] Found JRE Root at: $(Split-Path $jreRoot -Leaf)" -ForegroundColor DarkGray
+            
+            # Move contents of $jreRoot to $javaLatest
+            Get-ChildItem -Path $jreRoot | Move-Item -Destination $javaLatest -Force
+        } else {
+             # Fallback: Just move everything if no obvious structure
+             Get-ChildItem $tempDir | Move-Item -Destination $javaLatest -Force
+        }
+        
+        # Cleanup Temp
+        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+        
+        # Final Verification
         if (Test-Path $javaPath) {
             Write-Host "      [SUCCESS] Java restored and optimized." -ForegroundColor Green
             return $true
+        } else {
+             Write-Host "      [DEBUG] Expected: $javaPath" -ForegroundColor Red
+             Write-Host "      [DEBUG] Actual Structure (jre):" -ForegroundColor Red
+             try { Get-ChildItem -Path $jreDir -Recurse -Depth 2 | Select-Object FullName | Format-Table -HideTableHeaders | Out-String | Write-Host } catch {}
         }
     }
     
@@ -1215,17 +1389,32 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 
 # --- Launcher Self-Update ---
-$remoteLauncherHash = Get-RemoteHash "game launcher.bat"
-if ($remoteLauncherHash) {
+
+try {
+    $remoteLauncherHash = Get-RemoteHash "game launcher.bat"
+}
+catch {
+    $remoteLauncherHash = $null
+}
+
+if (-not $remoteLauncherHash) {
+    Write-Host "`n[WARNING] Update server is unreachable." -ForegroundColor Yellow
+    Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
+}
+else {
     # $f is passed from the CMD bootstrap as the full path to this file
     $localLauncherHash = Get-LocalSha1 $f
+
     if ($localLauncherHash -ne $remoteLauncherHash) {
         Write-Host "`n[UPDATE] A new version of the launcher is available!" -ForegroundColor Yellow
+
         $tempLauncher = "$f.new"
+
         if (Download-WithProgress "$API_HOST/file/game%20launcher.bat" $tempLauncher $false) {
             Write-Host "      [SUCCESS] Update downloaded. Restarting launcher..." -ForegroundColor Green
             Start-Sleep -Seconds 1
-            # Overwrite and restart using CMD to avoid locks. We use long paths with quotes to prevent 8.3 naming (GAMELA~2.BAT).
+
+            # Overwrite and restart using CMD to avoid file locks
             $cmd = "timeout /t 1 >nul & move /y `"$tempLauncher`" `"$f`" & cmd /c `"$f`""
             Start-Process cmd.exe -ArgumentList "/c $cmd" -WindowStyle Normal
             exit
@@ -1238,22 +1427,21 @@ if ($remoteLauncherHash) {
 
 
 
-
-
 $forceShowMenu = $false
-# Detect and kill existing instances
-$procName = "HytaleClient"
-if (Get-Process $procName -ErrorAction SilentlyContinue) {
-    Write-Host "      [INFO] Hytale is already running. Closing for rerun..." -ForegroundColor Yellow
-    try {
-        taskkill /F /IM "${procName}.exe" /T 2>$null | Out-Null
-        # Also clean up Java if it's stuck
-        taskkill /F /IM "java.exe" /T 2>$null | Out-Null
-        Start-Sleep -Seconds 2 
-    } catch {}
-}
 
 while ($true) {
+    # Detect and kill existing instances (Ensure clean state per user request)
+    $procName = "HytaleClient"
+    if (Get-Process $procName -ErrorAction SilentlyContinue) {
+        Write-Host "      [INFO] Hytale is already running. Closing for rerun..." -ForegroundColor Yellow
+        try {
+            taskkill /F /IM "${procName}.exe" /T 2>$null | Out-Null
+            # Also clean up Java if it's stuck
+            taskkill /F /IM "java.exe" /T 2>$null | Out-Null
+            Start-Sleep -Seconds 2 
+        } catch {}
+    }
+
     # REFRESH DYNAMIC PATHS based on current $gameExe
     $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
     $appDir = Join-Path $launcherRoot "release\package\game\latest"
@@ -1280,164 +1468,163 @@ while ($true) {
         $localHash = Get-LocalSha1 $gameExe
     }
 
-try {
-    $rData = Invoke-RestMethod -Uri "$API_HOST/api/hash/HytaleClient.exe" -Headers $global:HEADERS -Method Get -TimeoutSec 3
-    $serverOnline = $true
-    
-    Write-Host "      Local:  $localHash" -ForegroundColor Gray
-    Write-Host "      Server: $($rData.hash)" -ForegroundColor Gray
+    try {
+        $rData = Invoke-RestMethod -Uri "$API_HOST/api/hash/HytaleClient.exe" -Headers $global:HEADERS -Method Get -TimeoutSec 3
+        $serverOnline = $true
+        
+        Write-Host "      Local:  $localHash" -ForegroundColor Gray
+        Write-Host "      Server: $($rData.hash)" -ForegroundColor Gray
 
-    if ($localHash -eq $rData.hash) {
-        $f2pMatch = $true
-        $global:lastVerifiedHash = $localHash
-        $global:lastVerifiedTime = Get-Date
-        Write-Host "[OK] F2P Smart-Patch detected and verified." -ForegroundColor Green
-    } else {
-        Write-Host "[INFO] Official PWR version detected (Hash mismatch)." -ForegroundColor Cyan
-    }
-} catch {
-    Write-Host "[WARN] Update server unreachable." -ForegroundColor Yellow
-}
-
-# 3. Decision Tree
-if ((Test-Path $gameExe) -and -not $forceShowMenu) {
-    # AUTO-LAUNCH (Both F2P and PWR)
-    if ($f2pMatch) {
-        Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
-    } else {
-        $latestVer = Get-LatestPatchVersion
-        
-        # 1. Smart Applied Check (Hash or Version based)
-        $isApplied = ($localHash -eq $global:pwrHash) -or ($global:pwrVersion -ge $latestVer)
-        
-        # Diagnostic Debugging
-        if ($env:IS_SHORTCUT -eq "true") {
-            Write-Host "      [DEBUG] Local:  $localHash" -ForegroundColor Gray
-            Write-Host "      [DEBUG] Target: $global:pwrHash" -ForegroundColor Gray
-            Write-Host "      [DEBUG] Ver:    $global:pwrVersion (Latest: $latestVer)" -ForegroundColor Gray
-        }
-        
-        if ($isApplied) {
-            Write-Host "[INFO] Local version is up-to-date (Version: $latestVer)." -ForegroundColor Green
-            # Ensure hash is synced if version matched
-            if ($localHash -ne $global:pwrHash) { $global:pwrHash = $localHash; Save-Config }
+        if ($localHash -eq $rData.hash) {
+            $f2pMatch = $true
+            $global:lastVerifiedHash = $localHash
+            $global:lastVerifiedTime = Get-Date
+            Write-Host "[OK] F2P Smart-Patch detected and verified." -ForegroundColor Green
         } else {
-            Write-Host "[INFO] Official PWR version detected. Checking for updates..." -ForegroundColor Magenta
-            $patchPath = Find-OfficialPatch $latestVer
-            $hasValidPatch = $false
-            if ($patchPath -and (Test-Path $patchPath)) {
-                # Basic size check for integrity (patches are usually > 100MB)
-                if ((Get-Item $patchPath).Length -gt 10MB) { $hasValidPatch = $true }
-            }
+            Write-Host "[INFO] Official PWR version detected (Hash mismatch)." -ForegroundColor Cyan
+        }
+    } catch {
+        Write-Host "[WARN] Update server unreachable." -ForegroundColor Yellow
+    }
 
-            if ($global:autoUpdate) {
-                Write-Host "      [AUTO] New version $latestVer detected. Updating now..." -ForegroundColor Cyan
-                if (Invoke-OfficialUpdate $latestVer) { continue }
+    # 3. Decision Tree
+    if ((Test-Path $gameExe) -and -not $forceShowMenu) {
+        # AUTO-LAUNCH (Both F2P and PWR)
+        if ($f2pMatch) {
+            Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
+        } else {
+            $latestVer = Get-LatestPatchVersion
+            
+            # 1. Smart Applied Check (Hash or Version based)
+            $isApplied = ($localHash -eq $global:pwrHash) -or ($global:pwrVersion -ge $latestVer)
+            
+            # Diagnostic Debugging
+            if ($env:IS_SHORTCUT -eq "true") {
+                Write-Host "      [DEBUG] Local:  $localHash" -ForegroundColor Gray
+                Write-Host "      [DEBUG] Target: $global:pwrHash" -ForegroundColor Gray
+                Write-Host "      [DEBUG] Ver:    $global:pwrVersion (Latest: $latestVer)" -ForegroundColor Gray
+            }
+            
+            if ($isApplied) {
+                Write-Host "[INFO] Local version is up-to-date (Version: $latestVer)." -ForegroundColor Green
+                # Ensure hash is synced if version matched
+                if ($localHash -ne $global:pwrHash) { $global:pwrHash = $localHash; Save-Config }
             } else {
-                Write-Host "`n[UPDATE] A new Official Version ($latestVer) is available!" -ForegroundColor Yellow
-                $uChoice = Read-Host "          Do you want to update the game? (y/n) [y]"
-                if ($uChoice -eq "n") {
-                    Write-Host "      [SKIP] Proceeding with current version." -ForegroundColor Gray
-                    $global:pwrVersion = $latestVer; $global:pwrHash = $localHash; Save-Config
+                Write-Host "[INFO] Official PWR version detected. Checking for updates..." -ForegroundColor Magenta
+                $patchPath = Find-OfficialPatch $latestVer
+                $hasValidPatch = $false
+                if ($patchPath -and (Test-Path $patchPath)) {
+                    # Basic size check for integrity (patches are usually > 100MB)
+                    if ((Get-Item $patchPath).Length -gt 10MB) { $hasValidPatch = $true }
+                }
+
+                if ($global:autoUpdate) {
+                    Write-Host "      [AUTO] New version $latestVer detected. Updating now..." -ForegroundColor Cyan
+                    if (Invoke-OfficialUpdate $latestVer) { continue }
                 } else {
-                    $autoU = Read-Host "          Do you want to auto-update games when you launch the game? (y/n)"
-                    if ($autoU -eq "y") { $global:autoUpdate = $true; Save-Config }
-                    
-                    if (Invoke-OfficialUpdate $latestVer) { 
-                        Write-Host "      [INFO] Update applied successfully." -ForegroundColor Green
-                        continue 
+                    Write-Host "`n[UPDATE] A new Official Version ($latestVer) is available!" -ForegroundColor Yellow
+                    $uChoice = Read-Host "          Do you want to update the game? (y/n) [y]"
+                    if ($uChoice -eq "n") {
+                        Write-Host "      [SKIP] Proceeding with current version." -ForegroundColor Gray
+                        $global:pwrVersion = $latestVer; $global:pwrHash = $localHash; Save-Config
+                    } else {
+                        $autoU = Read-Host "          Do you want to auto-update games when you launch the game? (y/n)"
+                        if ($autoU -eq "y") { $global:autoUpdate = $true; Save-Config }
+                        
+                        if (Invoke-OfficialUpdate $latestVer) { 
+                            Write-Host "      [INFO] Update applied successfully." -ForegroundColor Green
+                            continue 
+                        }
                     }
                 }
             }
-        }
-        Write-Host "[2/2] Launching Official PWR version..." -ForegroundColor Magenta
-    }
-    
-    # Always verify assets and deps after any repair
-    if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
-    if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
-    
-} else {
-    # SHOW MENU ONLY IF MISSING OR RECOVERY NEEDED
-    if (-not (Test-Path $gameExe)) {
-        Write-Host "[!] Hytale is not installed or files are missing." -ForegroundColor Red
-    } elseif (-not $f2pMatch) {
-         Write-Host "[!] Local version does not match F2P server." -ForegroundColor Yellow
-    }
-    
-    if ($forceShowMenu) {
-        Write-Host "`n[RECOVERY] You have missing or corrupt files. Please re-download." -ForegroundColor Red
-        Write-Host "            (Option [2] is highly recommended based on server hash)" -ForegroundColor Cyan
-    }
-
-    $opt2Text = if ($global:javaMissingFlag) { "[2] FIX MISSING JAVA / Update Smart-Patch" } else { "[2] Download/Update to Hytale F2P (Smart-Patch)" }
-    $opt2Color = if ($global:javaMissingFlag) { "Yellow" } else { "White" }
-    Write-Host "`nAvailable Actions:" -ForegroundColor White
-    Write-Host " [1] Download Official Hytale Patches (PWR)" -ForegroundColor White
-    Write-Host " $opt2Text" -ForegroundColor $opt2Color
-    Write-Host " [3] Attempt Force Launch anyway" -ForegroundColor Gray
-    $choice = Read-Host "`n Select an option [1]"
-    if ($choice -eq "") { $choice = "1" }
-
-    if ($choice -eq "1") {
-        # Discover latest version
-        $latestVer = Get-LatestPatchVersion
-        if (Invoke-OfficialUpdate $latestVer) { pause }
-        continue
-    } 
-    elseif ($choice -eq "2") {
-        # Reset verification flags to force full check after repair
-        $global:assetsVerified = $false
-        $global:depsVerified = $false
-
-        # F2P DOWNLOAD LOGIC WITH PERSISTENT CACHE
-        # Use the f2pMatch result from earlier
-        $coreNeedsRepair = -not $f2pMatch
-        $javaMissing = -not (Test-Path (Join-Path $launcherRoot "release\package\jre\latest\bin\java.exe"))
-        
-        if ($coreNeedsRepair) {
-            Write-Host "`n[ACTION] Repairing/Updating F2P Core..." -ForegroundColor Magenta
-            if ($f2pMatch -eq $false -and (Test-Path $gameExe)) {
-                Write-Host "      [INFO] Replacing Official PWR version with F2P Core..." -ForegroundColor Cyan
-            }
-            
-            # Check disk space (Zip + Extraction room)
-            if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { pause; continue }
-            
-            $localZip = Join-Path $cacheDir $ZIP_FILENAME
-            $needsDownload = Test-FileNeedsDownload $localZip $ZIP_FILENAME
-            
-            if ($needsDownload) {
-                Write-Host "      [DOWNLOAD] Fetching $ZIP_FILENAME..." -ForegroundColor Cyan
-                if (-not (Download-WithProgress "$API_HOST/file/$ZIP_FILENAME" $localZip)) {
-                    Write-Host "      [ERROR] Download failed. Check your connection." -ForegroundColor Red
-                    pause; continue
-                }
-            }
-            
-            Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
-            if (Expand-WithProgress $localZip $appDir) {
-                Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
-            } else {
-                Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
-                if ($localZip) { Remove-Item $localZip -Force }
-                pause; continue
-            }
-        } elseif ($javaMissing) {
-            Write-Host "`n[ACTION] Targeted Java Repair..." -ForegroundColor Magenta
-            if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
-        } else {
-            Write-Host "`n[INFO] Core and Engine look healthy. Refreshing assets..." -ForegroundColor Cyan
+            Write-Host "[2/2] Launching Official PWR version..." -ForegroundColor Magenta
         }
         
         # Always verify assets and deps after any repair
         if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
+        if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
+        
+    } else {
+        # SHOW MENU ONLY IF MISSING OR RECOVERY NEEDED
+        if (-not (Test-Path $gameExe)) {
+            Write-Host "[!] Hytale is not installed or files are missing." -ForegroundColor Red
+        } elseif (-not $f2pMatch) {
+            Write-Host "[!] Local version does not match F2P server." -ForegroundColor Yellow
+        }
+        
+        if ($forceShowMenu) {
+            Write-Host "`n[RECOVERY] You have missing or corrupt files. Please re-download." -ForegroundColor Red
+            Write-Host "            (Option [2] is highly recommended based on server hash)" -ForegroundColor Cyan
+        }
 
-        $global:javaMissingFlag = $false
-        Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
+        $opt2Text = if ($global:javaMissingFlag) { "[2] FIX MISSING JAVA / Update Smart-Patch" } else { "[2] Download/Update to Hytale F2P (Smart-Patch)" }
+        $opt2Color = if ($global:javaMissingFlag) { "Yellow" } else { "White" }
+        Write-Host "`nAvailable Actions:" -ForegroundColor White
+        Write-Host " [1] Download Official Hytale Patches (PWR)" -ForegroundColor White
+        Write-Host " $opt2Text" -ForegroundColor $opt2Color
+        Write-Host " [3] Attempt Force Launch anyway" -ForegroundColor Gray
+        $choice = Read-Host "`n Select an option [1]"
+        if ($choice -eq "") { $choice = "1" }
+
+        if ($choice -eq "1") {
+            # Discover latest version
+            $latestVer = Get-LatestPatchVersion
+            if (Invoke-OfficialUpdate $latestVer) { continue }
+        } 
+        elseif ($choice -eq "2") {
+            # Reset verification flags to force full check after repair
+            $global:assetsVerified = $false
+            $global:depsVerified = $false
+
+            # F2P DOWNLOAD LOGIC WITH PERSISTENT CACHE
+            # Use the f2pMatch result from earlier
+            $coreNeedsRepair = -not $f2pMatch
+            $javaMissing = -not (Test-Path (Join-Path $launcherRoot "release\package\jre\latest\bin\java.exe"))
+            
+            if ($coreNeedsRepair) {
+                Write-Host "`n[ACTION] Repairing/Updating F2P Core..." -ForegroundColor Magenta
+                if ($f2pMatch -eq $false -and (Test-Path $gameExe)) {
+                    Write-Host "      [INFO] Replacing Official PWR version with F2P Core..." -ForegroundColor Cyan
+                }
+                
+                # Check disk space (Zip + Extraction room)
+                if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { pause; continue }
+                
+                $localZip = Join-Path $cacheDir $ZIP_FILENAME
+                $needsDownload = Test-FileNeedsDownload $localZip $ZIP_FILENAME
+                
+                if ($needsDownload) {
+                    Write-Host "      [DOWNLOAD] Fetching $ZIP_FILENAME..." -ForegroundColor Cyan
+                    if (-not (Download-WithProgress "$API_HOST/file/$ZIP_FILENAME" $localZip)) {
+                        Write-Host "      [ERROR] Download failed. Check your connection." -ForegroundColor Red
+                        pause; continue
+                    }
+                }
+                
+                Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
+                if (Expand-WithProgress $localZip $appDir) {
+                    Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
+                } else {
+                    Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
+                    if ($localZip) { Remove-Item $localZip -Force }
+                    pause; continue
+                }
+            } elseif ($javaMissing) {
+                Write-Host "`n[ACTION] Targeted Java Repair..." -ForegroundColor Magenta
+                if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
+            } else {
+                Write-Host "`n[INFO] Core and Engine look healthy. Refreshing assets..." -ForegroundColor Cyan
+            }
+            
+            # Always verify assets and deps after any repair
+            if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
+
+            $global:javaMissingFlag = $false
+            Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
+        }
+        elseif ($choice -ne "3") { exit }
     }
-    elseif ($choice -ne "3") { exit }
-}
 
 # --- LAUNCH SEQUENCE ---
 
@@ -1495,6 +1682,7 @@ if (Test-Path $cfgFile) {
         if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
         if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
         if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
+        if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
     } catch {}
 }
 
@@ -1533,25 +1721,39 @@ if (Test-Path $savesDir) {
 }
 # ------------------------------------------------------
 
-Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
-Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
-$authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
-$body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
-try {
-    $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
-    $idToken = $res.identityToken; $ssToken = $res.sessionToken
-    Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
-    Save-Config # Persist successful auth endpoint
-} catch {
-    $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
-    $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
-    $ssToken = $idToken
-    Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
-    Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
-}
+# --- LAUNCH RESTART LOOP ---
+while ($true) {
+
+    if (-not $global:offlineMode) {
+        Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
+        Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
+        $authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
+        $body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
+        try {
+            $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
+            $idToken = $res.identityToken; $ssToken = $res.sessionToken
+            Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
+            Save-Config # Persist successful auth endpoint
+        } catch {
+            $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
+            $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
+            $ssToken = $idToken
+            Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
+            Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "`n[3/4] Skipped Authentication (Offline Mode)" -ForegroundColor Magenta
+        $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
+        $ssToken = $idToken
+    }
+
+
+
+# Support Registering Session before Menu
+Register-PlayerSession $global:pUuid $global:pName
 
 # 2. Main Menu Loop (Skipped if Shortcut)
-$isShortcut = ($env:IS_SHORTCUT -eq "true")
+$isShortcut = ($env:IS_SHORTCUT -eq "false")
 $proceedToLaunch = $false
 
 while (-not $proceedToLaunch) {
@@ -1567,10 +1769,15 @@ while (-not $proceedToLaunch) {
     Write-Host "       HYTALE F2P - LAUNCHER MENU" -ForegroundColor Cyan
     Write-Host "==========================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
+    if ($global:ispBlocked) {
+        Write-Host " [1] Start Hytale F2P (Create Shortcut) [BLOCKED]" -ForegroundColor DarkGray
+    } else {
+        Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
+    }
     Write-Host " [2] Setup Host Server (Download server.bat)" -ForegroundColor Yellow
     Write-Host " [3] Repair / Force Update" -ForegroundColor Red
     Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
+    Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
     Write-Host ""
     
     $menuChoice = Read-Host " Select an option [1]"
@@ -1578,6 +1785,7 @@ while (-not $proceedToLaunch) {
 
     switch ($menuChoice) {
         "1" {
+            if ($global:ispBlocked) { Write-Host "      [BLOCK] API Access Required. Use Offline Mode [5] or fix connection." -ForegroundColor Red; Start-Sleep 2; continue }
             Create-Shortcut $f $gameExe 
             $proceedToLaunch = $true
         }
@@ -1628,23 +1836,15 @@ while (-not $proceedToLaunch) {
             $proceedToLaunch = $true 
         }
         "4" {
-            Write-Host "`n[HYFIXES] Downloading HyFixes Optimization Bundle..." -ForegroundColor Cyan
-            $hyUrl = "https://github.com/John-Willikers/hyfixes/releases/download/v1.11.0/hyfixes-bundle-v1.11.0.zip"
-            $hyZip = Join-Path $cacheDir "hyfixes.zip"
-            
-            if (Download-WithProgress $hyUrl $hyZip $false) {
-                Write-Host "      [EXTRACT] Installing plugins..." -ForegroundColor Cyan
-                
-                # Extract directly to Server directory as requested
-                $serverDir = Join-Path $appDir "Server"
-                if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
-                
-                if (Expand-WithProgress $hyZip $serverDir) {
-                    Write-Host "      [SUCCESS] HyFixes installed to Server directory!" -ForegroundColor Green
-                }
+            if (Install-HyFixes) {
+                # Success message is handled inside function
             }
             Write-Host "`nPress any key to return to menu..."
             [void][System.Console]::ReadKey($true)
+        }
+        "5" {
+             $global:offlineMode = $true
+             $proceedToLaunch = $true
         }
     }
 }
@@ -1684,16 +1884,26 @@ if ($isAdmin) { Assert-FirewallRule $gameExe }
 # 2. Duplicate Mod Removal (Standard User OK)
 Remove-DuplicateMods (Join-Path $appDir "mods")
 Remove-DuplicateMods (Join-Path $appDir "earlyplugins")
+
+# 3. Environment Sanitization (Prevent external Java conflicts)
+if ($env:_JAVA_OPTIONS -or $env:CLASSPATH) {
+    Write-Host "      [SAFETY] Clearing conflicting Java environment variables..." -ForegroundColor DarkGray
+    $env:_JAVA_OPTIONS = $null
+    $env:CLASSPATH = $null
+}
 # ------------------------
 
 $dispJava = if ($global:javaPath) { $global:javaPath } else { $javaExe }
 Write-Host "      Java:     $dispJava" -ForegroundColor Gray
 Write-Host "      User:     $global:pName" -ForegroundColor Cyan
 
+# Support explicit offline arg if user requested it, otherwise default to authenticated guest
+$authModeArg = if ($global:offlineMode) { "offline" } else { "authenticated" }
+
 $launchArgs = @(
     "--app-dir", "`"$appDir`"",
     "--java-exec", "`"$dispJava`"",
-    "--auth-mode", "authenticated",
+    "--auth-mode", $authModeArg,
     "--uuid", $global:pUuid,
     "--name", "`"$global:pName`"",
     "--identity-token", $idToken,
@@ -1701,7 +1911,7 @@ $launchArgs = @(
     "--user-dir", "`"$userDir`""
 )
 
-# Authenticate
+# Authenticate (Final Safety Check)
 if (-not $idToken) {
     $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
     $ssToken = $idToken
@@ -1716,6 +1926,14 @@ if (Test-Path $gameExe) {
     $global:detectedIssuerUrl = $null
 
     Write-Host "      [LAUNCH] Starting process..." -ForegroundColor Cyan
+    
+    # Redact sensitive info for debug print
+    $dbgArgs = $launchArgs -join ' '
+    if ($global:pUuid) { $dbgArgs = $dbgArgs.Replace($global:pUuid, "<UUID>") }
+    if ($idToken) { $dbgArgs = $dbgArgs.Replace($idToken, "<ID_TOKEN>") }
+    if ($ssToken) { $dbgArgs = $dbgArgs.Replace($ssToken, "<SESSION_TOKEN>") }
+    
+    Write-Host "      [DEBUG] Args: $dbgArgs" -ForegroundColor DarkGray
     
     $gameProc = Start-Process -FilePath $gameExe -ArgumentList $launchArgs `
                 -WorkingDirectory (Split-Path $gameExe) `
@@ -1732,7 +1950,13 @@ if (Test-Path $gameExe) {
     $stable = $false
     $guiDetected = $false
     $currentProc = $gameProc
-    $maxWait = 300 
+    $guiDetected = $false
+    $currentProc = $gameProc
+    $maxWait = [int]::MaxValue # Monitor indefinitely (User Request)
+    $minimized = $false
+
+    # Add assembly for MessageBox
+    Add-Type -AssemblyName System.Windows.Forms 
 
     for ($i = 0; $i -lt $maxWait; $i++) {
         Start-Sleep -Seconds 1
@@ -1740,65 +1964,270 @@ if (Test-Path $gameExe) {
         
         if (-not $cp) {
             if ($currentProc.HasExited -and $currentProc.ExitCode -eq 0) {
-                Write-Host "`r      [INFO] Launcher hand-off detected. Searching..." -ForegroundColor Cyan -NoNewline
-                Start-Sleep -Seconds 1
-                $found = Get-Process | Where-Object { ($_.ProcessName -match "java" -or $_.ProcessName -match "Hytale") -and $_.StartTime -gt (Get-Date).AddSeconds(-15) } | Select-Object -First 1
-                if ($found) {
-                    $currentProc = $found
-                    Write-Host "`r      [ADOPT] Now monitoring: $($found.ProcessName) (PID: $($found.Id))" -ForegroundColor Green
-                    continue 
-                }
+                 # Clean exit (even if GUI wasn't caught yet)
+                 Write-Host "`n[INFO] Hytale exited with Code 0." -ForegroundColor Gray
+                 Unregister-PlayerSession $global:pUuid
+                 exit 0
             }
-            Write-Host " [FAILED]" -ForegroundColor Red
-            $stable = $false; break
+            # Only print failed if we really lost it and it wasn't a handoff
+            if (-not $found) {
+                if ($guiDetected) {
+                     # Normal exit by user
+                     Write-Host "`n[INFO] Hytale closed normally." -ForegroundColor Gray
+                     Unregister-PlayerSession $global:pUuid
+                     exit 0
+                }
+                Write-Host " [FAILED]" -ForegroundColor Red
+                $stable = $false; break
+            }
+        } else {
+             # Only refresh if process object is valid
+             $cp.Refresh()
         }
-        
-        $cp.Refresh()
 
-        # Log Monitoring
+        # Log Monitoring (Live)
         $newLogs = Get-ChildItem -Path $logPath -Filter "*.log" | Where-Object { $_.LastWriteTime -gt $preLaunchLogDate }
         foreach ($nl in $newLogs) {
-            $errors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\|" }
+            $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
+            $errors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" }
             foreach ($err in $errors) {
+                Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
                 if ($reportedErrors -notcontains $err) {
-                    Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
-                    $reportedErrors += $err
-                    if ($err -match "expected (https?://[^\s,]+)") {
-                        $global:detectedIssuerUrl = $matches[1]
-                        Write-Host "      [DETECTED] Client requires specific issuer: $global:detectedIssuerUrl" -ForegroundColor Cyan
-                        Stop-Process -Id $cp.Id -Force -ErrorAction SilentlyContinue
-                        $stable = $false; break
+                    
+                    # --- PRIORITY 1: JWT/TOKEN VALIDATION ERRORS (Check full log for root cause) ---
+                    # When "Server failed to boot" occurs, first check if it's actually a JWT issue
+                    $isJwtError = $logContent -match "Token validation failed" -or $logContent -match "signature verification failed" -or $logContent -match "No Ed25519 key found"
+                    
+                    if ($isJwtError) {
+                        # --- FIX FOR SERVER JWT VALIDATION FAILURE ---
+                        Write-Host "`n      [FIX] Server Token Validation Error Detected (Root Cause)!" -ForegroundColor Red
+                        Write-Host "      [INFO] Server is missing authentication keys. Installing patched server..." -ForegroundColor Cyan
+                        
+                        $reportedErrors += $err
+                        
+                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                        
+                        if (-not $global:serverPatched) {
+                            Write-Host "      [ACTION] Downloading pre-patched server with correct keys..." -ForegroundColor Yellow
+                            
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 1
+                            
+                            if (Patch-HytaleServer $serverJarPath) {
+                                $global:serverPatched = $true
+                                Write-Host "      [SUCCESS] Server patched! Restarting game..." -ForegroundColor Green
+                                
+                                Start-Sleep -Seconds 2
+                                $global:forceRestart = $true
+                                $stable = $false
+                                break
+                            } else {
+                                Write-Host "      [ERROR] Failed to patch server. Manual intervention required." -ForegroundColor Red
+                            }
+                        } else {
+                            Write-Host "      [INFO] Server already patched this session. Ignoring." -ForegroundColor Gray
+                        }
+                    }
+                    # --- PRIORITY 2: VM/JRE ERRORS (Only if NOT a JWT error) ---
+                    elseif ($err -match "VM Initialization Error" -or $err -match "Failed setting boot class path") {
+                        
+                        Write-Host "`n      [AUTO-RECOVERY] Critical boot failure detected!" -ForegroundColor Magenta
+                        Write-Host "      [ERROR] $($err.Trim())" -ForegroundColor Red
+                        
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "Boot Error Detected!`n$($err.Trim())`n`nAttempting auto-fix...", 
+                            "Hytale Auto-Recovery", 
+                            [System.Windows.Forms.MessageBoxButtons]::OK, 
+                            [System.Windows.Forms.MessageBoxIcon]::Warning, 
+                            [System.Windows.Forms.MessageBoxDefaultButton]::Button1, 
+                            [System.Windows.Forms.MessageBoxOptions]::ServiceNotification
+                        ) | Out-Null
+                        
+                        Write-Host "      [ACTION] Killing process to attempt repairs..." -ForegroundColor Yellow
+                        # Fix: Use $currentProc.Id explicitly as $cp might be unstable if process is mid-crash
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        
+                        $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
+                        $cacheFixed = $false
+
+                        # --- A. CACHE CLEANING ---
+                        if ($logContent -match "Found AOT cache, enabling for faster startup: (.+)") {
+                            $aotFile = $matches[1].Trim()
+                            if (Test-Path $aotFile) {
+                                Write-Host "      [FIX] Deleting corrupted AOT Cache: $aotFile" -ForegroundColor Yellow
+                                Remove-Item $aotFile -Force -ErrorAction SilentlyContinue
+                                $cacheFixed = $true
+                            }
+                        }
+                        if (-not $cacheFixed -and $logContent -match '--prefab-cache="([^"]+)"') {
+                            $prefabDir = $matches[1].Trim()
+                            if (Test-Path $prefabDir) {
+                                Write-Host "      [FIX] Deleting potential corrupted Prefab Cache: $prefabDir" -ForegroundColor Yellow
+                                Remove-Item $prefabDir -Recurse -Force -ErrorAction SilentlyContinue
+                                $cacheFixed = $true
+                            }
+                        }
+
+                        if ($cacheFixed) {
+                            Write-Host "[SUCCESS] Cache cleanup complete. Restarting..." -ForegroundColor Green
+                            Start-Sleep -Seconds 2
+                            $stable = $false; 
+                            $global:forceRestart = $true
+                            break
+                        }
+
+                        # --- B. ADVANCED JAVA REPAIR ---
+                        if ($err -match "Failed setting boot class path" -or $err -match "VM Initialization Error" -or $err -match "Server failed to boot") {
+                            # New Logic: Delete Corrupted JRE to Force Re-download
+                            # SMART-SWITCH: Mark session to use API Host, Delete JRE, Restart Loop
+                            Write-Host "      [FIX] JRE Corruption detected. Switching to API Host JRE & purging..." -ForegroundColor Yellow
+                            
+                            $global:forceApiJre = $true
+                            
+                            $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
+                            
+                            try {
+                                if (Test-Path $jreDir) {
+                                    Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue
+                                    Write-Host "[SUCCESS] JRE Purged. Launcher will re-download clean runtime." -ForegroundColor Green
+                                    
+                                    # We also remove the zip cache to force a fresh fetch
+                                    $jreZip = Join-Path $cacheDir "jre_package.zip"
+                                    if (Test-Path $jreZip) { Remove-Item $jreZip -Force -ErrorAction SilentlyContinue }
+
+                                    Start-Sleep -Seconds 2
+                                    $stable = $false; 
+                                    $global:forceRestart = $true
+                                    break
+                                }
+                            } catch { Write-Host "      [ERROR] Failed to purge JRE: $($_.Exception.Message)" -ForegroundColor Red }
+                        }
+
+                        # --- HYFIXES FALLBACK (Priority 3) ---
+                        # User Request: Don't run HyFixes for VM Init errors as it doesn't help.
+                        # Only run for generic "Server failed to boot" if no other fixes applied.
+                        if (-not ($err -match "VM Initialization Error") -and $global:pwrVersion -and $global:pwrVersion -notin $global:autoFixedVersions) {
+                            Write-Host "      [FIX] Attempting to apply HyFixes automatically..." -ForegroundColor Cyan
+                            if (Install-HyFixes) {
+                                Write-Host "[SUCCESS] Fix applied. Restarting..." -ForegroundColor Green
+                                if (-not $global:autoFixedVersions) { $global:autoFixedVersions = @() }
+                                $global:autoFixedVersions += $global:pwrVersion
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                                $stable = $false; 
+                                $global:forceRestart = $true
+                                break
+                            }
+                        }
+                    }
+                    elseif ($err -match "Identity token has invalid issuer: expected (https?://[^\s,]+)") {
+                        # --- FIX FOR ISSUER MISMATCH ---
+                        $expectedUrl = $matches[1].TrimEnd('/')
+                        
+                        Write-Host "`n      [FIX] Issuer Mismatch Detected!" -ForegroundColor Red
+                        Write-Host "      [INFO] Game expects: $expectedUrl" -ForegroundColor Cyan
+                        
+                        # Mark this error as handled to prevent re-detection
+                        $reportedErrors += $err
+                        
+                        if ($global:AUTH_URL_CURRENT -ne $expectedUrl) {
+                            Write-Host "      [ACTION] Updating configuration to match Game Client..." -ForegroundColor Yellow
+                            
+                            # 1. Update Global
+                            $global:AUTH_URL_CURRENT = $expectedUrl
+                            
+                            # 2. Persist to file immediately
+                            Save-Config
+                            
+                            # 3. Kill the current game process (it will restart with new URL)
+                            Write-Host "      [ACTION] Restarting game with corrected settings..." -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 2
+
+                            # 4. Trigger Restart
+                            $global:forceRestart = $true
+                            $stable = $false
+                            break
+                        } else {
+                            # URL is already correct, this is a stale error from old log
+                            Write-Host "      [INFO] Configuration already correct. Ignoring stale log entry." -ForegroundColor Gray
+                        }
+                    }
+                    else {
+                        # Non-critical error - just log it
+                        $reportedErrors += $err
                     }
                 }
             }
-            if ($global:detectedIssuerUrl) { break }
+            if ($global:forceRestart) { break }
         }
-        if ($global:detectedIssuerUrl) { break }
+        if ($global:forceRestart) { break }
+
+        # UX: Notify User of Fixed State
+        if ($global:forceRestart) {
+             [System.Windows.Forms.MessageBox]::Show("Fix applied!`nPlease try joining the server again.", "Hytale Auto-Recovery", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+             break
+        }
 
         $memMB = [math]::Round($cp.WorkingSet64 / 1MB, 0)
-        Write-Host "`r      [STATS] Mem: $($memMB)MB | Waiting for GUI...   " -NoNewline -ForegroundColor Gray
+        
+        # Zero-Memory Exit Logic (Game Closed)
+        if ($guiDetected -and $memMB -le 0) {
+             Write-Host "`n[INFO] Game Process Exited (Zero Memory). Closing." -ForegroundColor Gray
+             $stable = $true
+             break 
+        }
+
+        if (-not $guiDetected) {
+            Write-Host "`r      [STATS] Mem: $($memMB)MB | Waiting for GUI...   " -NoNewline -ForegroundColor Gray
+        } else {
+            # Update status less frequently to not spam CPU
+            if ($i % 5 -eq 0) {
+                 Write-Host "`r      [MONITOR] Listening for server errors... (Mem: $($memMB)MB)   " -NoNewline -ForegroundColor DarkGray
+            }
+        }
         
         if ($cp.MainWindowHandle -ne [IntPtr]::Zero) {
-            [User32]::SetForegroundWindow($cp.MainWindowHandle) | Out-Null
-            Write-Host "`r      [SUCCESS] Game Window Detected!              " -ForegroundColor Green
-            $stable = $true
-            $guiDetected = $true
-            break
+            
+            if (-not $guiDetected) {
+                # UX: Minimize Launcher to Tray/Taskbar while listening
+                if (-not $minimized) {
+                    # 6 = SW_MINIMIZE
+                    $consolePtr = (Get-Process -Id $PID).MainWindowHandle
+                    [User32]::ShowWindow($consolePtr, 6) | Out-Null
+                    $minimized = $true
+                }
+
+                Write-Host "`r      [SUCCESS] Game Window Detected! Listening for errors..." -ForegroundColor Green
+                Write-Host "`r      [SUCCESS] Hytale is running successfully!" -ForegroundColor Green
+                $stable = $true
+                $guiDetected = $true
+            }
         }
+    }
+    
+    # --- POST-LOOP LOGIC ---
+    # We reached here if:
+    # 1. 10 minutes passed ($maxWait)
+    # 2. Process exited manually
+    # 3. Crash detected and handled (restart triggered)
+    # 4. Issuer mismatch break
+
+    if ($minimized) {
+        # Restore window if we minimized it
+        # 9 = SW_RESTORE
+        $consolePtr = (Get-Process -Id $PID).MainWindowHandle
+        [User32]::ShowWindow($consolePtr, 9) | Out-Null
     }
     Write-Host ""
 
-    if ($global:detectedIssuerUrl) {
-        Write-Host "`n[AUTO-FIX] Detected Issuer mismatch. Retrying..." -ForegroundColor Cyan
-        $global:AUTH_URL_CURRENT = $global:detectedIssuerUrl
-        $global:detectedIssuerUrl = $null
-        Save-Config 
-        Start-Sleep -Seconds 2
+
+    if ($global:forceRestart) {
+        $global:forceRestart = $false
         continue
     }
 
     if ($guiDetected) {
-        Write-Host "Hytale is running successfully!" -ForegroundColor Green
         Write-Host "Auto-Closing launcher in 10 seconds..." -ForegroundColor Cyan
         Start-Sleep -Seconds 10
         # Forcibly close the console window by exiting the host
@@ -1808,8 +2237,11 @@ if (Test-Path $gameExe) {
         break
     } else {
         Write-Host "[CRIT] Process exited." -ForegroundColor Red
-        if (Test-Path $logPath) { Show-LatestLogs $logPath }
+        if (Test-Path $logPath) { 
+            Show-LatestLogs $logPath 
+        }
         pause
     }
+}
 }
 }
