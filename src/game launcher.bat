@@ -62,7 +62,7 @@ exit /b
 $ProgressPreference = 'SilentlyContinue'
 
 # --- SECURITY PROTOCOL (Fix for GitHub Downloads) ---
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # --- Filename Restoration (Fix GAMELA~2.BAT Bug) ---
 if ($f -match "GAMELA~") {
@@ -138,7 +138,6 @@ try {
 $REQ_CORE_SPACE = 888 * 1024 * 1024     # 888 MB
 $REQ_ASSET_SPACE = 2 * 1024 * 1024 * 1024 # 2 GB
 
-# --- Configuration ---
 # --- Configuration ---
 $global:HEADERS = @{
     'User-Agent'    = 'HytaleF2P-Client-v2.0.11';
@@ -248,11 +247,6 @@ $profilesDir = Join-Path $localAppData "profiles"
 
 # Ensure global directories exist
 @($cacheDir, $profilesDir) | ForEach-Object { if (-not (Test-Path $_)) { New-Item -ItemType Directory $_ -Force | Out-Null } }
-
-$global:HEADERS = @{
-    'User-Agent'    = 'HytaleF2P-Client-v2.0.11';
-    'X-Auth-Token'  = 'YourSuperSecretLaunchToken12345';
-}
 
 # --- JWT Generation Helper ---
 function New-HytaleJWT($uuid, $name, $issuer) {
@@ -529,35 +523,77 @@ function Patch-HytaleClient($clientPath) {
 }
 
 function Patch-HytaleServer($serverJarPath) {
-    if (-not (Test-Path (Split-Path $serverJarPath))) { return $false }
+    if (-not (Test-Path (Split-Path $serverJarPath))) { 
+        New-Item -ItemType Directory (Split-Path $serverJarPath) -Force | Out-Null 
+    }
     
     $patchFlag = "$serverJarPath.dualauth_patched"
     $targetDomain = "auth.sanasol.ws"
+    $minValidSize = 1024 * 1024  # Minimum 1MB for valid JAR
     
-    if (Test-Path $patchFlag) { return $true } # Assume patched if flag exists
-    
+    # Only trust flag if JAR exists AND is valid size
+    if ((Test-Path $patchFlag) -and (Test-Path $serverJarPath)) {
+        $jarSize = (Get-Item $serverJarPath).Length
+        if ($jarSize -ge $minValidSize) {
+            Write-Host "      [SKIP] Server JAR already patched ($([math]::Round($jarSize/1MB, 2)) MB)" -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "      [WARN] Flag exists but JAR is invalid/missing. Re-downloading..." -ForegroundColor Yellow
+            Remove-Item $patchFlag -Force -ErrorAction SilentlyContinue
+        }
+    } elseif (Test-Path $patchFlag) {
+        Write-Host "      [WARN] Flag exists but JAR is missing. Re-downloading..." -ForegroundColor Yellow
+        Remove-Item $patchFlag -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host "      [SERVER] Downloading Pre-Patched Server JAR..." -ForegroundColor Cyan
     
-    # Download from R2 as per Node code
-    $url = "https://pub-027b315ece074e2e891002ca38384792.r2.dev/HytaleServer.jar"
+    # Define Sources
+    $primaryUrl = "https://pub-027b315ece074e2e891002ca38384792.r2.dev/HytaleServer.jar"
+    $fallbackUrl = "$API_HOST/file/HytaleServer.jar"
     
     # Create backup of original if exists
     if (Test-Path $serverJarPath) {
         Move-Item $serverJarPath "$serverJarPath.original" -Force -ErrorAction SilentlyContinue
     }
     
-    if (Download-WithProgress $url $serverJarPath $false) {
-        $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "R2" }
-        $flagObj | ConvertTo-Json | Out-File $patchFlag
-        Write-Host "      [SUCCESS] Patched Server JAR installed." -ForegroundColor Green
-        return $true
-    } else {
-        # Restore backup if failed
-        if (Test-Path "$serverJarPath.original") {
-            Move-Item "$serverJarPath.original" $serverJarPath -Force
+    # Attempt 1: Primary Source (R2)
+    Write-Host "      [TRY] Primary Source (R2)..." -ForegroundColor Gray
+    if (Download-WithProgress $primaryUrl $serverJarPath $false) {
+        # Verify download
+        if ((Test-Path $serverJarPath) -and ((Get-Item $serverJarPath).Length -ge $minValidSize)) {
+            $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "R2" }
+            $flagObj | ConvertTo-Json | Out-File $patchFlag
+            Write-Host "      [SUCCESS] Patched Server JAR installed via R2." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "      [WARN] R2 download incomplete or corrupted." -ForegroundColor Yellow
+            if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
         }
-        return $false
+    } 
+    
+    # Attempt 2: Fallback Source (API Host)
+    Write-Host "      [FALLBACK] R2 failed. Attempting API Host download..." -ForegroundColor Yellow
+    if (Download-WithProgress $fallbackUrl $serverJarPath $true) {
+        # Verify download
+        if ((Test-Path $serverJarPath) -and ((Get-Item $serverJarPath).Length -ge $minValidSize)) {
+            $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "API_HOST" }
+            $flagObj | ConvertTo-Json | Out-File $patchFlag
+            Write-Host "      [SUCCESS] Patched Server JAR installed via API Host." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "      [WARN] API Host download incomplete or corrupted." -ForegroundColor Yellow
+            if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
+        }
     }
+
+    # Final Failure: Restore backup if available
+    Write-Host "      [ERROR] All server patch sources failed." -ForegroundColor Red
+    if (Test-Path "$serverJarPath.original") {
+        Move-Item "$serverJarPath.original" $serverJarPath -Force
+        Write-Host "      [INFO] Original server JAR restored." -ForegroundColor Gray
+    }
+    return $false
 }
 
 function Assert-DiskSpace($path, $requiredBytes) {
@@ -734,51 +770,175 @@ function Test-FileNeedsDownload($filePath, $fileName) {
 }
 
 function Download-WithProgress($url, $destination, $useHeaders=$true) {
+    # --- PHASE 1: CHECK FOR EXISTING wget.exe ---
+    # Check for REAL wget.exe (not PowerShell's alias to Invoke-WebRequest)
+    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    
+    # Also check Chocolatey bin folder directly (in case PATH isn't refreshed)
+    if (-not $wgetExe) {
+        $chocoWget = "C:\ProgramData\chocolatey\bin\wget.exe"
+        if (Test-Path $chocoWget) {
+            $wgetExe = [PSCustomObject]@{ Source = $chocoWget }
+            Write-Host "      [FOUND] wget.exe in Chocolatey bin folder" -ForegroundColor Gray
+        }
+    }
+    
+    # Only try to install wget if running as admin (choco requires admin)
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+    
+    if (-not $wgetExe -and $isAdmin) {
+        Write-Host "[SETUP] wget.exe not found. Installing via Chocolatey (Admin Mode)..." -ForegroundColor Yellow
+        
+        $chocoExe = "C:\ProgramData\chocolatey\bin\choco.exe"
+        if (-not (Test-Path $chocoExe)) {
+            # Check if choco is on PATH
+            $chocoCmd = Get-Command choco -ErrorAction SilentlyContinue
+            if ($chocoCmd) { $chocoExe = $chocoCmd.Source }
+        }
+        
+        if (Test-Path $chocoExe) {
+            # Run choco with timeout
+            $stdoutFile = Join-Path $env:TEMP "choco_stdout_$(Get-Random).log"
+            $stderrFile = Join-Path $env:TEMP "choco_stderr_$(Get-Random).log"
+            try {
+                $proc = Start-Process $chocoExe -ArgumentList "install wget -y --no-progress" -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+                $completed = $proc.WaitForExit(60000)  # 60s timeout
+                
+                if (-not $completed) {
+                    Write-Host "      [TIMEOUT] Choco hung. Using HTTP fallback..." -ForegroundColor Yellow
+                    try { $proc.Kill() } catch {}
+                } else {
+                    if (Test-Path $stdoutFile) {
+                        $stdout = Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue
+                        if ($stdout -and $stdout.Length -lt 2000) { Write-Host "      [CHOCO] $stdout" -ForegroundColor Gray }
+                    }
+                    Write-Host "      [CHOCO] Exit Code: $($proc.ExitCode)" -ForegroundColor $(if ($proc.ExitCode -eq 0) { "Green" } else { "Yellow" })
+                }
+            } catch {
+                Write-Host "      [CHOCO ERROR] $($_.Exception.Message)" -ForegroundColor Yellow
+            } finally {
+                if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
+                if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
+            }
+            
+            # Refresh path and re-check
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            $chocoWget = "C:\ProgramData\chocolatey\bin\wget.exe"
+            if (Test-Path $chocoWget) {
+                $wgetExe = [PSCustomObject]@{ Source = $chocoWget }
+            }
+        } else {
+            Write-Host "      [SKIP] Chocolatey not installed. Using HTTP fallback..." -ForegroundColor Gray
+        }
+    } elseif (-not $wgetExe) {
+        Write-Host "      [SKIP] wget not found, not admin. Using HTTP fallback..." -ForegroundColor Gray
+    }
+
+    # --- PHASE 2: TURBO ATTEMPT (wget.exe) ---
+    if ($wgetExe) {
+        Write-Host "`n[TURBO] Initializing wget high-speed transfer..." -ForegroundColor Cyan
+        
+        $dir = Split-Path $destination
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+
+        $wgetArgs = @(
+            "--continue", 
+            "--tries=3", 
+            "--timeout=30", 
+            "--show-progress", 
+            "--no-check-certificate", 
+            "--user-agent='Mozilla/5.0'"
+        )
+        
+        # Add auth header for API Host downloads
+        if ($useHeaders -and $global:HEADERS) {
+            foreach ($key in $global:HEADERS.Keys) {
+                $wgetArgs += "--header=`"${key}: $($global:HEADERS[$key])`""
+            }
+        }
+        
+        $wgetArgs += @("-O", "`"$destination`"", "`"$url`"")
+
+        try {
+            # Capture stderr to temp file for debugging
+            $stderrFile = Join-Path $env:TEMP "wget_stderr_$(Get-Random).log"
+            $proc = Start-Process $wgetExe.Source -ArgumentList $wgetArgs -Wait -NoNewWindow -PassThru -RedirectStandardError $stderrFile
+            
+            if ($proc.ExitCode -eq 0) {
+                if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
+                Write-Host "      [SUCCESS] Turbo download complete." -ForegroundColor Green
+                return $true
+            }
+            
+            # Show stderr on failure
+            if (Test-Path $stderrFile) {
+                $stderrContent = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
+                if ($stderrContent) {
+                    Write-Host "      [WGET STDERR] $($stderrContent.Trim())" -ForegroundColor Red
+                }
+                Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "      [WARN] Turbo transfer interrupted (Code: $($proc.ExitCode))." -ForegroundColor Yellow
+        } catch {
+            Write-Host "      [WARN] wget failed to start: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    # --- PHASE 3: STANDARD FALLBACK (Fixed for Exceptions) [cite: 109, 110, 112] ---
+    Write-Host "`n[FALLBACK] Starting memory-efficient streaming download..." -ForegroundColor Gray
+    
+    # Ensure modern security protocols for R2/CDN [cite: 1]
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
     $client = New-Object System.Net.Http.HttpClient
     $client.Timeout = [System.TimeSpan]::FromMinutes(120)
     
-    # 1. Automatic Resume (Range Support)
-    $existingOffset = 0
-    if (Test-Path $destination) {
-        $existingOffset = (Get-Item $destination).Length
-    }
-    
-    if ($useHeaders) { 
+    # Add headers BEFORE URL check (required for API Host auth)
+    if ($useHeaders -and $global:HEADERS) { 
         foreach ($key in $global:HEADERS.Keys) { $client.DefaultRequestHeaders.TryAddWithoutValidation($key, $global:HEADERS[$key]) } 
     }
+    
+    # Verify URL Access [cite: 111, 126]
+    try {
+        $headRequest = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url)
+        $check = $client.SendAsync($headRequest).GetAwaiter().GetResult()
+        if (-not $check.IsSuccessStatusCode) {
+            Write-Host "      [ERROR] URL unreachable: $($check.StatusCode)" -ForegroundColor Red
+            return $false
+        }
+    } catch {
+        Write-Host "      [ERROR] Could not connect to storage node." -ForegroundColor Red
+        return $false
+    }
+
+    $existingOffset = 0
+    if (Test-Path $destination) { $existingOffset = (Get-Item $destination).Length }
     
     if ($existingOffset -gt 0) {
         $client.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($existingOffset, $null)
     }
 
     try {
+        # ResponseHeadersRead prevents the memory buffering exception 
         $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         
-        # 2. Handle 416 (Range Not Satisfiable)
         if ($response.StatusCode -eq [System.Net.HttpStatusCode]::RequestedRangeNotSatisfiable) {
              $client.Dispose()
              Remove-Item $destination -Force
              return Download-WithProgress $url $destination $useHeaders
         }
         
-        if (-not $response.IsSuccessStatusCode) { 
-            Write-Host "      [ERROR] Server returned $($response.StatusCode)" -ForegroundColor Red
-            return $false 
-        }
+        if (-not $response.IsSuccessStatusCode) { return $false }
         
         $isPartial = $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent
         $contentLength = $response.Content.Headers.ContentLength
         $totalSize = if ($isPartial) { $contentLength + $existingOffset } else { $contentLength }
         
-        # 3. HIGH-SPEED STREAMING (HttpClient is better than WebClient for 1GB+ files)
         $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $fileStream = if ($isPartial) {
-            [System.IO.File]::Open($destination, [System.IO.FileMode]::Append)
-        } else {
-            [System.IO.File]::Create($destination)
-        }
+        $fileStream = if ($isPartial) { [System.IO.File]::Open($destination, [System.IO.FileMode]::Append) } 
+                      else { [System.IO.File]::Create($destination) }
         
-        $buffer = New-Object byte[] 4194304 # 4MB Buffer for maximum throughput
+        $buffer = New-Object byte[] 4MB 
         $downloaded = if ($isPartial) { $existingOffset } else { 0 }
         $lastUpdate = $downloaded
         $startTime = [DateTime]::Now
@@ -786,24 +946,22 @@ function Download-WithProgress($url, $destination, $useHeaders=$true) {
         while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $fileStream.Write($buffer, 0, $read)
             $downloaded += $read
-            # Update Every 10MB to keep CPU overhead low
             if ($downloaded -ge ($lastUpdate + 10MB) -or $downloaded -eq $totalSize) {
                 $lastUpdate = $downloaded
                 $percent = [math]::Floor(($downloaded / $totalSize) * 100)
                 $elapsed = ([DateTime]::Now - $startTime).TotalSeconds
                 $speed = if ($elapsed -gt 0) { [math]::Round(($downloaded - $existingOffset) / 1MB / $elapsed, 2) } else { 0 }
                 $bar = ("#" * [math]::Floor($percent/5)) + ("." * (20 - [math]::Floor($percent/5)))
-                Write-Host "`r      Progress: [$bar] $percent% ($([math]::Round($downloaded/1MB,2)) / $([math]::Round($totalSize/1MB,2)) MB) @ $speed MB/s   " -NoNewline -ForegroundColor Yellow
+                Write-Host "`r      Progress: [$bar] $percent% ($([math]::Round($downloaded/1MB,2)) MB) @ $speed MB/s   " -NoNewline -ForegroundColor Yellow
             }
         }
         Write-Host ""; return $true
     } catch { 
         Write-Host "`n      [DOWNLOAD EXCEPTION] $($_.Exception.Message)" -ForegroundColor Red
         return $false 
-    }
-    finally { 
-        if ($fileStream) { $fileStream.Close(); $fileStream.Dispose() }
-        if ($stream) { $stream.Close(); $stream.Dispose() }
+    } finally { 
+        if ($fileStream) { $fileStream.Dispose() }
+        if ($stream) { $stream.Dispose() }
         if ($client) { $client.Dispose() }
     }
 }
@@ -1994,6 +2152,41 @@ if (Test-Path $gameExe) {
                 Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
                 if ($reportedErrors -notcontains $err) {
                     
+                    # --- PRIORITY 0: NullReferenceException from AppMainMenu (Missing Server) ---
+                    $isAppMainMenuNullRef = $err -match "AppMainMenu.*NullReferenceException" -or $err -match "HytaleClient\.Application\.AppMainMenu.*NullReferenceException"
+                    
+                    if ($isAppMainMenuNullRef) {
+                        # Check if Server directory exists
+                        $serverDir = Join-Path $appDir "Server"
+                        $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
+                        
+                        Write-Host "`n      [FIX] AppMainMenu NullReferenceException Detected!"-ForegroundColor Red
+                        Write-Host "      [CHECK] Verifying Server directory exists..." -ForegroundColor Cyan
+                        
+                        if (-not (Test-Path $serverDir) -or -not (Test-Path $serverJarPath)) {
+                            Write-Host "      [MISSING] Server directory or JAR not found at: $serverDir" -ForegroundColor Yellow
+                            Write-Host "      [ACTION] Triggering Patch-HytaleServer to download..."-ForegroundColor Yellow
+                            
+                            $reportedErrors += $err
+                            
+                            # Kill current process before patching
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 1
+                            
+                            if (Patch-HytaleServer $serverJarPath) {
+                                Write-Host "      [SUCCESS] Server installed! Restarting game..." -ForegroundColor Green
+                                Start-Sleep -Seconds 2
+                                $global:forceRestart = $true
+                                $stable = $false
+                                break
+                            } else {
+                                Write-Host "      [ERROR] Failed to install server. Manual intervention required." -ForegroundColor Red
+                            }
+                        } else {
+                            Write-Host "      [INFO] Server directory exists. Issue may be something else." -ForegroundColor Gray
+                            $reportedErrors += $err
+                        }
+                    }
                     # --- PRIORITY 1: JWT/TOKEN VALIDATION ERRORS (Check full log for root cause) ---
                     # When "Server failed to boot" occurs, first check if it's actually a JWT issue
                     $isJwtError = $logContent -match "Token validation failed" -or $logContent -match "signature verification failed" -or $logContent -match "No Ed25519 key found"
