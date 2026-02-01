@@ -70,6 +70,32 @@ When the same error appears 3+ times, the launcher:
 
 ---
 
+## Recent Improvements (February 2026)
+
+### Fresh Installation Experience
+The launcher now fully supports starting from scratch:
+- Empty folders are now accepted as valid installation paths
+- When you select a drive root like `C:\`, the launcher automatically creates a `HytaleF2P` subdirectory
+- Path detection improved to find `HytaleClient.exe` whether it's in the root or the `Client\` subfolder
+- No more "invalid path" errors when doing a clean install
+
+### Smarter Game Launch Process
+Added safety checks before starting the game:
+- Launcher verifies `HytaleClient.exe` exists at the configured path before attempting to launch
+- If the game files are missing, you're automatically taken to the repair menu instead of crashing
+- The `Patch-HytaleClient` function now skips gracefully if no client is found, preventing patch errors on incomplete installations
+
+### Download Experience Polish
+Fixed wget progress visibility:
+- Download progress bars now show up correctly in real-time during file downloads
+- Removed the stderr redirect that was hiding the `--show-progress` output
+- Better error messages when downloads fail
+
+### Minor Fixes
+- Corrected the launcher self-update hash check (was checking "game launcher.bata" instead of "game launcher.bat")
+
+---
+
 ## 🔧 What this PowerShell Script Fixes
 
 This script doesn't just "open" the game; it actively repairs the following problems:
@@ -104,7 +130,7 @@ This script doesn't just "open" the game; it actively repairs the following prob
 
 ---
 
-## ⚙️ Auto-Recovery Error Types
+## 📂 Auto-Recovery Error Types
 
 The launcher monitors game logs in real-time and automatically handles these specific errors:
 
